@@ -55,11 +55,94 @@ async function clickUntilState(page, selector, { attr = 'aria-checked', want = '
     return false;
 }
 
+async function withTimeout(promise, timeoutMs, label) {
+    let timeoutId;
+    const timeout = new Promise((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    });
+
+    try {
+        return await Promise.race([promise, timeout]);
+    } finally {
+        clearTimeout(timeoutId);
+    }
+}
+
+async function closePageSafely(page, label = 'Page') {
+    if (!page || page.isClosed()) return true;
+    try {
+        await withTimeout(page.close({ runBeforeUnload: false }), 5000, `${label} close`);
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
+async function closeBrowserSafely(browser, label = 'Browser') {
+    if (!browser) return true;
+    try {
+        await withTimeout(browser.close(), 10000, `${label} close`);
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+        return await fetch(url, { ...options, signal: controller.signal });
+    } finally {
+        clearTimeout(timeoutId);
+    }
+}
+
+async function installBandwidthSaver(context) {
+    const blockedResourceTypes = new Set(['image', 'media', 'font']);
+    const blockedUrlParts = [
+        'googletagmanager.com',
+        'google-analytics.com',
+        'doubleclick.net',
+        'facebook.net',
+        'hotjar.com',
+        'segment.io',
+        'amplitude.com',
+        'clarity.ms',
+    ];
+
+    await context.route('**/*', async (route) => {
+        const request = route.request();
+        const resourceType = request.resourceType();
+        const url = request.url().toLowerCase();
+
+        const shouldBlock =
+            blockedResourceTypes.has(resourceType) ||
+            blockedUrlParts.some((part) => url.includes(part));
+
+        try {
+            if (shouldBlock) {
+                await route.abort('blockedbyclient');
+            } else {
+                await route.continue();
+            }
+        } catch (_) {
+            // The browser may close a request during navigation; ignore route races.
+        }
+    });
+
+    console.log('🪶 Bandwidth saver active: blocking images, media, fonts, and tracking calls');
+}
+
 async function applyFilters(page, filters, searchRadius) {
     console.log('🎯 Applying UI filters...');
 
     if (!await setSearchRadius(page, searchRadius)) return false;
-    if (!await applyBodyTypeFilter(page, filters.bodyTypes)) return false;
+    const bodyTypeApplied = await applyBodyTypeFilter(page, filters.bodyTypes);
+    if (!bodyTypeApplied) {
+        console.log('  ⚠️ Body type filter did not fully apply; continuing with remaining filters');
+    }
     if (filters.makes && filters.makes.length > 0) {
         if (!await applyMakeFilter(page, filters.makes)) return false;
     }
@@ -554,7 +637,10 @@ await Actor.main(async () => {
     for (let filterAttempt = 1; filterAttempt <= 3; filterAttempt++) {
         // Fresh browser every attempt
         if (browser) {
-            await browser.close().catch(() => {});
+            const previousBrowserClosed = await closeBrowserSafely(browser, 'Previous browser');
+            if (!previousBrowserClosed) {
+                console.log('⚠️ Previous browser close timed out; continuing with a fresh launch');
+            }
         }
 
         console.log(`\n🔄 Starting fresh browser (attempt ${filterAttempt}/3)...`);
@@ -578,6 +664,8 @@ await Actor.main(async () => {
             geolocation: { longitude: -79.3832, latitude: 43.6532 },
             permissions: ['geolocation'],
         });
+
+        await installBandwidthSaver(context);
 
         page = await context.newPage();
 
@@ -612,7 +700,12 @@ await Actor.main(async () => {
     }
 
     if (!filtersSucceeded) {
-        if (browser) await browser.close().catch(() => {});
+        if (browser) {
+            const browserClosed = await closeBrowserSafely(browser);
+            if (!browserClosed) {
+                console.log('⚠️ Browser close timed out after filter failure; ending run anyway');
+            }
+        }
         console.log('🛑 Could not apply filters after 3 attempts. Will retry on next scheduled run.');
         return;
     }
@@ -736,7 +829,7 @@ await Actor.main(async () => {
                 await listingPage.waitForTimeout(2000);
 
                 // Extract data from the listing tab
-                const carData = await listingPage.evaluate(() => {
+                const carData = await withTimeout(listingPage.evaluate(() => {
                     const preflight = window.__PREFLIGHT__ || {};
                     const listing = preflight.listing || {};
 
@@ -817,12 +910,16 @@ await Actor.main(async () => {
                         url: window.location.href,
                         source: 'dom'
                     };
-                });
+                }), 25000, `Listing ${listingIndex + 1} data extraction`);
 
                 // Close the listing tab — back to search results automatically
-                await listingPage.close();
+                const listingTabClosed = await closePageSafely(listingPage, 'Listing tab');
                 listingPage = null;
-                console.log(`  ✅ Listing tab closed`);
+                if (listingTabClosed) {
+                    console.log(`  ✅ Listing tab closed`);
+                } else {
+                    console.log(`  ⚠️ Listing tab close timed out; continuing`);
+                }
 
                 // Add page metadata
                 carData.pageNumber = pageToScrape;
@@ -856,11 +953,11 @@ await Actor.main(async () => {
 
                     try {
                         const webhookUrl = 'https://n8nsaved-production.up.railway.app/webhook/cargurus';
-                        const response = await fetch(webhookUrl, {
+                        const response = await fetchWithTimeout(webhookUrl, {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify(dataToSave)
-                        });
+                        }, 10000);
                         if (response.ok) {
                             console.log(`  📤 Sent to webhook (${response.status})`);
                         } else {
@@ -879,7 +976,10 @@ await Actor.main(async () => {
             } catch (error) {
                 console.error(`❌ Error processing listing ${listingIndex + 1}:`, error.message);
                 if (listingPage) {
-                    await listingPage.close().catch(() => {});
+                    const listingTabClosed = await closePageSafely(listingPage, 'Listing tab after error');
+                    if (!listingTabClosed) {
+                        console.log(`  ⚠️ Listing tab close timed out after error; continuing`);
+                    }
                     listingPage = null;
                 }
             }
@@ -907,6 +1007,9 @@ await Actor.main(async () => {
         console.error(`❌ Error processing pages ${pagesToScrape.join(', ')}:`, error.message);
     }
 
-    await browser.close();
+    const browserClosed = await closeBrowserSafely(browser);
+    if (!browserClosed) {
+        console.log('⚠️ Browser close timed out at end of run');
+    }
     console.log('\n✅ Scraping complete!');
 });
